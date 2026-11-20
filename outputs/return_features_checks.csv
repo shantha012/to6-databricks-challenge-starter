@@ -1,0 +1,11 @@
+check,detail,result
+exact columns,"['return_id', 'tax_year', 'deduction_to_income']",PASS
+no filer id or raw amounts,"['return_id', 'tax_year', 'deduction_to_income']",PASS
+row count = accepted returns,12 vs 12,PASS
+each return_id once,12 distinct of 12,PASS
+same return_ids as accepted batch,identical,PASS
+tax_year unchanged,all rows,PASS
+R04 ratio = deduction/income from source,source 59/400 = 0.1475; saved 0.1475,PASS
+all nonzero ratios match source,all match,PASS
+zero-income returns kept with NULL ratio,"{'R03': {'return_id': 'R03', 'tax_year': 2022, 'deduction_to_income': None}, 'R09': {'return_id': 'R09', 'tax_year': 2024, 'deduction_to_income': None}}",PASS
+NULL ratio only for zero income,"['R03', 'R09']",PASS

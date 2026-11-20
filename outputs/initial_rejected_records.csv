@@ -1,0 +1,4 @@
+batch,rule,reason,return_id,taxpayer_id,tax_year,income,deduction,checked_at_utc
+initial,completeness,missing required value(s): income,R02,F1,2022,,33,2026-11-20T16:46:09+00:00
+initial,uniqueness,return_id occurs 2 times (must be exactly once),R01,F0,2022,100,20,2026-11-20T16:46:09+00:00
+initial,uniqueness,return_id occurs 2 times (must be exactly once),R01,F0,2022,100,20,2026-11-20T16:46:09+00:00

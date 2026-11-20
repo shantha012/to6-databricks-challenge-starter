@@ -1,0 +1,77 @@
+{
+  "checked_at_utc": "2026-11-20T16:46:09+00:00",
+  "rules": {
+    "completeness": "Required fields return_id, tax_year, income and deduction must be non-null",
+    "uniqueness": "Each return_id must occur exactly once in the batch",
+    "nonnegative_amounts": "income and deduction must be >= 0 (zero income is valid)"
+  },
+  "initial": {
+    "table": "training.to6_challenge3_inputs.returns_initial",
+    "decision": "REJECTED",
+    "reason": "training.to6_challenge3_inputs.returns_initial rejected: completeness failed on 1 row(s); uniqueness failed on 2 row(s)",
+    "affected_records_table": "training.to6_c3_c399a52409d8.initial_rejected_records",
+    "rule_results": [
+      {
+        "batch": "initial",
+        "table": "training.to6_challenge3_inputs.returns_initial",
+        "rule": "completeness",
+        "definition": "Required fields return_id, tax_year, income and deduction must be non-null",
+        "total_rows": 13,
+        "violating_rows": 1,
+        "result": "FAIL"
+      },
+      {
+        "batch": "initial",
+        "table": "training.to6_challenge3_inputs.returns_initial",
+        "rule": "uniqueness",
+        "definition": "Each return_id must occur exactly once in the batch",
+        "total_rows": 13,
+        "violating_rows": 2,
+        "result": "FAIL"
+      },
+      {
+        "batch": "initial",
+        "table": "training.to6_challenge3_inputs.returns_initial",
+        "rule": "nonnegative_amounts",
+        "definition": "income and deduction must be >= 0 (zero income is valid)",
+        "total_rows": 13,
+        "violating_rows": 0,
+        "result": "PASS"
+      }
+    ]
+  },
+  "corrected": {
+    "table": "training.to6_challenge3_inputs.returns_corrected",
+    "decision": "ACCEPTED",
+    "rule_results": [
+      {
+        "batch": "corrected",
+        "table": "training.to6_challenge3_inputs.returns_corrected",
+        "rule": "completeness",
+        "definition": "Required fields return_id, tax_year, income and deduction must be non-null",
+        "total_rows": 12,
+        "violating_rows": 0,
+        "result": "PASS"
+      },
+      {
+        "batch": "corrected",
+        "table": "training.to6_challenge3_inputs.returns_corrected",
+        "rule": "uniqueness",
+        "definition": "Each return_id must occur exactly once in the batch",
+        "total_rows": 12,
+        "violating_rows": 0,
+        "result": "PASS"
+      },
+      {
+        "batch": "corrected",
+        "table": "training.to6_challenge3_inputs.returns_corrected",
+        "rule": "nonnegative_amounts",
+        "definition": "income and deduction must be >= 0 (zero income is valid)",
+        "total_rows": 12,
+        "violating_rows": 0,
+        "result": "PASS"
+      }
+    ]
+  },
+  "accepted_input": "training.to6_challenge3_inputs.returns_corrected"
+}

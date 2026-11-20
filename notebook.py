@@ -49,6 +49,10 @@ print({"input_schema": INPUT_SCHEMA, "output_schema": OUTPUT_SCHEMA})
 
 # MAGIC %md
 # MAGIC return_initial , return_corrected:
+# MAGIC
+# MAGIC Return-Initial : table witht he intial batch data
+# MAGIC return_corrected : table with corrected infromation after eliminating duplicates and incorrect data from return_initial. 
+# MAGIC
 # MAGIC return_id identifies the return; 
 # MAGIC taxpayer_id identifies its filer . There can be multiple return per fielr over the years.
 # MAGIC Required fields are return_id, tax_year, income and deduction. 
@@ -195,7 +199,128 @@ display(spark.sql(f"""
 
 # COMMAND ----------
 
-# Your checks and decision here.
+# DBTITLE 1,Quality gate: reject initial batch, assess corrected batch
+from datetime import datetime, timezone
+
+REQUIRED_FIELDS = ["return_id", "tax_year", "income", "deduction"]
+RULES = {
+    "completeness": "Required fields return_id, tax_year, income and deduction must be non-null",
+    "uniqueness": "Each return_id must occur exactly once in the batch",
+    "nonnegative_amounts": "income and deduction must be >= 0 (zero income is valid)",
+}
+
+class BatchRejected(Exception):
+    """Raised when a batch fails a quality rule; feature output must not be written."""
+
+def find_violations(batch_name, table):
+    """Return every affected record (all columns kept) with the rule it breaks and why."""
+    missing_expr = "concat_ws(', ', " + ", ".join(
+        f"CASE WHEN {c} IS NULL THEN '{c}' END" for c in REQUIRED_FIELDS) + ")"
+    return spark.sql(f"""
+        WITH src AS (
+            SELECT *, COUNT(*) OVER (PARTITION BY return_id) AS id_occurrences FROM {table}
+        )
+        SELECT '{batch_name}' AS batch, 'completeness' AS rule,
+               'missing required value(s): ' || {missing_expr} AS reason,
+               return_id, taxpayer_id, tax_year, income, deduction
+        FROM src WHERE {' OR '.join(f'{c} IS NULL' for c in REQUIRED_FIELDS)}
+        UNION ALL
+        SELECT '{batch_name}', 'uniqueness',
+               'return_id occurs ' || id_occurrences || ' times (must be exactly once)',
+               return_id, taxpayer_id, tax_year, income, deduction
+        FROM src WHERE return_id IS NOT NULL AND id_occurrences > 1
+        UNION ALL
+        SELECT '{batch_name}', 'nonnegative_amounts', 'negative income or deduction',
+               return_id, taxpayer_id, tax_year, income, deduction
+        FROM src WHERE income < 0 OR deduction < 0
+    """)
+
+def assess_batch(batch_name, table):
+    """Apply the same rules to any batch; return (violations_df, per-rule summary list)."""
+    violations = find_violations(batch_name, table)
+    counts = {r["rule"]: r["n"] for r in violations.groupBy("rule").agg(F.count("*").alias("n")).collect()}
+    total_rows = spark.table(table).count()
+    summary = [
+        {"batch": batch_name, "table": table, "rule": rule, "definition": text,
+         "total_rows": total_rows, "violating_rows": counts.get(rule, 0),
+         "result": "FAIL" if counts.get(rule, 0) else "PASS"}
+        for rule, text in RULES.items()
+    ]
+    return violations, summary
+
+def require_valid(batch_name, table):
+    """Gate called BEFORE any feature output is written. Raises if any rule fails."""
+    violations, summary = assess_batch(batch_name, table)
+    failed = [s for s in summary if s["result"] == "FAIL"]
+    if failed:
+        raise BatchRejected(
+            f"{table} rejected: " + "; ".join(f"{s['rule']} failed on {s['violating_rows']} row(s)" for s in failed))
+    return table, summary
+
+from pyspark.sql import functions as F
+checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+# --- 1. Initial batch: must be rejected before feature output ---
+initial_violations, initial_summary = assess_batch("initial", INITIAL_TABLE)
+try:
+    require_valid("initial", INITIAL_TABLE)
+    initial_rejection = None
+except BatchRejected as e:
+    initial_rejection = str(e)
+print("Initial batch gate:", initial_rejection or "PASSED")
+assert initial_rejection is not None, "Expected the initial batch to be rejected"
+
+# Preserve affected records and reasons: Delta table (overwrite = rerun-safe) + repo exports
+REJECTED_TABLE = f"{OUTPUT_SCHEMA}.initial_rejected_records"
+(initial_violations.withColumn("checked_at_utc", F.lit(checked_at))
+    .write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(REJECTED_TABLE))
+rejected_pdf = (spark.table(REJECTED_TABLE).orderBy("rule", "return_id").toPandas()
+                .astype({"tax_year": "Int64", "income": "Int64", "deduction": "Int64"}))  # keep NULL as empty, not 100.0
+rejected_pdf.to_csv(repo_root / "outputs/initial_rejected_records.csv", index=False)
+
+# --- 2. Corrected batch: same rules; becomes the accepted input only if the gate passes ---
+corrected_violations, corrected_summary = assess_batch("corrected", CORRECTED_TABLE)
+ACCEPTED_TABLE, _ = require_valid("corrected", CORRECTED_TABLE)  # raises -> run stops, no features written
+print("Corrected batch gate: PASSED ->", ACCEPTED_TABLE)
+
+# Decision record for the evidence files
+decision = {
+    "checked_at_utc": checked_at,
+    "rules": RULES,
+    "initial": {"table": INITIAL_TABLE, "decision": "REJECTED", "reason": initial_rejection,
+                "affected_records_table": REJECTED_TABLE, "rule_results": initial_summary},
+    "corrected": {"table": CORRECTED_TABLE, "decision": "ACCEPTED", "rule_results": corrected_summary},
+    "accepted_input": ACCEPTED_TABLE,
+}
+(repo_root / "outputs/batch_decision.json").write_text(json.dumps(decision, indent=2) + "\n", encoding="utf-8")
+
+print("Rule results, both batches")
+display(spark.createDataFrame(initial_summary + corrected_summary))
+print("Preserved affected records (read back from", REJECTED_TABLE, ")")
+display(spark.table(REJECTED_TABLE).orderBy("rule", "return_id"))
+print("Corrected batch violations (expect none):", corrected_violations.count())
+
+# COMMAND ----------
+
+# DBTITLE 1,Batch decision: failure explanation and next action
+# MAGIC %md
+# MAGIC ### Batch decision
+# MAGIC
+# MAGIC The gate `require_valid()` runs every rule and raises `BatchRejected` if any rule fails. Section 3 writes features only from `ACCEPTED_TABLE`, which is set only after the gate passes. Both batches go through the same `RULES` and `find_violations()` code.
+# MAGIC
+# MAGIC **`returns_initial`: REJECTED.** No feature output was written from it.
+# MAGIC
+# MAGIC | Rule | Affected records | Why it fails |
+# MAGIC | --- | --- | --- |
+# MAGIC | completeness: `return_id`, `tax_year`, `income` and `deduction` must not be null | `R02` (F1, 2022, income NULL, deduction 33) | The income is unknown, so the deduction-to-income ratio cannot be computed. |
+# MAGIC | uniqueness: each `return_id` must occur exactly once | `R01` (F0, 2022, 100, 20), 2 identical rows | The return would appear twice in the features and splits. |
+# MAGIC | nonnegative amounts | none | PASS |
+# MAGIC
+# MAGIC All 3 affected rows are kept with their rule and reason in `training.to6_c3_c399a52409d8.initial_rejected_records` and `outputs/initial_rejected_records.csv`. The decision and rule results are in `outputs/batch_decision.json`.
+# MAGIC
+# MAGIC **Corrections I did not make:** I did not set `R02`'s income to 0. Zero income is a valid value that produces a null ratio, so filling it in would invent data. I did not drop the second `R01` row. I did not relax or remove a rule.
+# MAGIC
+# MAGIC **Next action:** `returns_corrected` was assessed with the same rules. Completeness, uniqueness and nonnegative amounts all PASS on its 12 rows, with 0 violations. `R02` now has income 200, and `R01` occurs once. It is therefore the accepted input for the final run, `ACCEPTED_TABLE = training.to6_challenge3_inputs.returns_corrected`. If a future corrected delivery failed, the gate would stop the run before section 3.
 
 # COMMAND ----------
 
@@ -205,7 +330,93 @@ display(spark.sql(f"""
 
 # COMMAND ----------
 
-# Your implementation and verification here.
+# DBTITLE 1,Build, save and verify return_features
+# Only the batch that passed the section 2 gate may feed feature output.
+assert ACCEPTED_TABLE == CORRECTED_TABLE, "Run section 2 first; no accepted batch"
+FEATURES_TABLE = f"{OUTPUT_SCHEMA}.return_features"
+FEATURE_COLUMNS = ["return_id", "tax_year", "deduction_to_income"]
+
+# deduction_to_income = deduction / income; NULL when income = 0 (return is kept, not dropped).
+# taxpayer_id, income and deduction are excluded under the need-to-know rule.
+features = spark.sql(f"""
+    SELECT return_id,
+           tax_year,
+           CASE WHEN income = 0 THEN CAST(NULL AS DOUBLE)
+                ELSE CAST(deduction AS DOUBLE) / income END AS deduction_to_income
+    FROM {ACCEPTED_TABLE}
+""")
+# Overwrite (not append) so reruns leave exactly one copy of each return.
+features.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(FEATURES_TABLE)
+
+# ---------- Verification: read the SAVED table back, compare with the source ----------
+saved = spark.table(FEATURES_TABLE)
+saved_rows = {r["return_id"]: r.asDict() for r in saved.collect()}
+source_rows = {r["return_id"]: r.asDict() for r in spark.table(ACCEPTED_TABLE).collect()}
+
+checks = []
+def check(name, passed, detail):
+    checks.append({"check": name, "result": "PASS" if passed else "FAIL", "detail": str(detail)})
+
+check("exact columns", saved.columns == FEATURE_COLUMNS, saved.columns)
+check("no filer id or raw amounts",
+      not {"taxpayer_id", "income", "deduction"} & set(saved.columns), saved.columns)
+check("row count = accepted returns", saved.count() == len(source_rows), f"{saved.count()} vs {len(source_rows)}")
+check("each return_id once", saved.select("return_id").distinct().count() == saved.count(),
+      f"{saved.select('return_id').distinct().count()} distinct of {saved.count()}")
+check("same return_ids as accepted batch", set(saved_rows) == set(source_rows),
+      sorted(set(saved_rows) ^ set(source_rows)) or "identical")
+check("tax_year unchanged", all(saved_rows[i]["tax_year"] == s["tax_year"] for i, s in source_rows.items()), "all rows")
+
+# Nonzero expected value derived from the source in Python (independent of the SQL above)
+src = source_rows["R04"]
+expected_r04 = src["deduction"] / src["income"]   # 59 / 400 = 0.1475
+actual_r04 = saved_rows["R04"]["deduction_to_income"]
+check("R04 ratio = deduction/income from source",
+      actual_r04 is not None and abs(actual_r04 - expected_r04) < 1e-12,
+      f"source {src['deduction']}/{src['income']} = {expected_r04}; saved {actual_r04}")
+
+# Every nonzero-income return matches deduction/income from the source
+mismatches = [i for i, s in source_rows.items() if s["income"] != 0
+              and abs(saved_rows[i]["deduction_to_income"] - s["deduction"] / s["income"]) > 1e-12]
+check("all nonzero ratios match source", not mismatches, mismatches or "all match")
+
+# Zero-income returns are kept with a NULL ratio
+zero_ids = sorted(i for i, s in source_rows.items() if s["income"] == 0)
+check("zero-income returns kept with NULL ratio",
+      bool(zero_ids) and all(i in saved_rows and saved_rows[i]["deduction_to_income"] is None for i in zero_ids),
+      {i: saved_rows.get(i) for i in zero_ids})
+null_ids = sorted(i for i, r in saved_rows.items() if r["deduction_to_income"] is None)
+check("NULL ratio only for zero income", null_ids == zero_ids, null_ids)
+
+checks_df = spark.createDataFrame(checks)
+display(checks_df)
+assert all(c["result"] == "PASS" for c in checks), "Feature table verification failed"
+
+print("Read-back of", FEATURES_TABLE)
+display(saved.orderBy("tax_year", "return_id"))
+
+# Small synthetic exports for the submission
+saved.orderBy("return_id").toPandas().to_csv(repo_root / "outputs/return_features.csv", index=False)
+checks_df.toPandas().to_csv(repo_root / "outputs/return_features_checks.csv", index=False)
+
+# COMMAND ----------
+
+# DBTITLE 1,Feature table contract and verification results
+# MAGIC %md
+# MAGIC ### Feature table: `training.to6_c3_c399a52409d8.return_features`
+# MAGIC
+# MAGIC * **Input:** `ACCEPTED_TABLE` = `training.to6_challenge3_inputs.returns_corrected`. Section 2's gate must pass before this table is built; the rejected initial batch is never used.
+# MAGIC * **Columns:** `return_id` (string), `tax_year` (int), `deduction_to_income` (double).
+# MAGIC * **Ratio:** `deduction_to_income = deduction / income`. If `income = 0`, the ratio is NULL and the return stays in the table.
+# MAGIC * **Need-to-know:** `taxpayer_id`, `income` and `deduction` are not written.
+# MAGIC * **Rerun safety:** the table is written in overwrite mode, so rerunning the notebook leaves one copy of each return.
+# MAGIC
+# MAGIC **Read-back verification:** all 10 checks PASS on the saved table.
+# MAGIC * **Contents:** exactly the three columns above, 12 rows and 12 distinct `return_id` values. These are the same IDs and tax years as the accepted batch.
+# MAGIC * **Nonzero expected value:** for `R04`, the source has deduction 59 and income 400, so the expected ratio is 59 / 400 = **0.1475**. The saved value is 0.1475. All other nonzero-income ratios also match the source.
+# MAGIC * **Zero income:** `R03` (2022) and `R09` (2024) have source income 0. Both are in the table with a NULL ratio, and they are the only rows with a NULL ratio.
+# MAGIC
+# MAGIC The check results are exported to `outputs/return_features_checks.csv`, and the table itself to `outputs/return_features.csv`.
 
 # COMMAND ----------
 
