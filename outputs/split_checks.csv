@@ -1,0 +1,9 @@
+check,detail,result
+features_train only 2022,"years=[2022], rows=4",PASS
+features_train columns,"['return_id', 'tax_year', 'deduction_to_income']",PASS
+features_validation only 2023,"years=[2023], rows=4",PASS
+features_validation columns,"['return_id', 'tax_year', 'deduction_to_income']",PASS
+features_test only 2024,"years=[2024], rows=4",PASS
+features_test columns,"['return_id', 'tax_year', 'deduction_to_income']",PASS
+every accepted return in exactly one split,"12 ids in splits, 12 in return_features",PASS
+splits == return_features (ids and values),0 differing rows,PASS

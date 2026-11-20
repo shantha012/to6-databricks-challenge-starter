@@ -37,7 +37,18 @@ CORRECTED_TABLE = f"{INPUT_SCHEMA}.returns_corrected"
 LINEAGE_VIEW = f"{INPUT_SCHEMA}.source_lineage"
 workspace_user = spark.sql("SELECT current_user() AS username").first()["username"]
 OUTPUT_SCHEMA = "training.to6_c3_" + hashlib.sha256(workspace_user.encode("utf-8")).hexdigest()[:12]
-print({"input_schema": INPUT_SCHEMA, "output_schema": OUTPUT_SCHEMA})
+
+# Run reference: start time of this complete run and this notebook's URL (kept in the run snapshot)
+from datetime import datetime, timezone
+RUN_STARTED_AT = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+NOTEBOOK_ID = "127024866559576"
+try:
+    _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+    NOTEBOOK_URL = f"https://{_ctx.browserHostName().get()}/editor/notebooks/{NOTEBOOK_ID}"
+except Exception:
+    NOTEBOOK_URL = f"https://{spark.conf.get('spark.databricks.workspaceUrl', '<workspace-host>')}/editor/notebooks/{NOTEBOOK_ID}"
+print({"input_schema": INPUT_SCHEMA, "output_schema": OUTPUT_SCHEMA,
+       "run_started_at": RUN_STARTED_AT, "notebook_url": NOTEBOOK_URL})
 
 # COMMAND ----------
 
@@ -427,4 +438,128 @@ checks_df.toPandas().to_csv(repo_root / "outputs/return_features_checks.csv", in
 
 # COMMAND ----------
 
-# Your implementation, rerun comparison and exports here.
+# DBTITLE 1,Save year splits, verify, snapshot this run
+# Splits are built FROM THE SAVED feature table, one tax year each, overwritten on every run.
+SPLITS = {2022: f"{OUTPUT_SCHEMA}.features_train",
+          2023: f"{OUTPUT_SCHEMA}.features_validation",
+          2024: f"{OUTPUT_SCHEMA}.features_test"}
+saved_features = spark.table(FEATURES_TABLE)
+for year, table in SPLITS.items():
+    (saved_features.where(F.col("tax_year") == year)
+        .write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(table))
+
+# ---------- Verify the saved splits by reading them back ----------
+split_checks = []
+def scheck(name, passed, detail):
+    split_checks.append({"check": name, "result": "PASS" if passed else "FAIL", "detail": str(detail)})
+
+union_splits = None
+for year, table in SPLITS.items():
+    t = spark.table(table)
+    years = sorted(r[0] for r in t.select("tax_year").distinct().collect())
+    scheck(f"{table.split('.')[-1]} only {year}", years == [year], f"years={years}, rows={t.count()}")
+    scheck(f"{table.split('.')[-1]} columns", t.columns == FEATURE_COLUMNS, t.columns)
+    tagged = t.withColumn("split_table", F.lit(table))
+    union_splits = tagged if union_splits is None else union_splits.unionByName(tagged)
+
+id_counts = union_splits.groupBy("return_id").count()
+scheck("every accepted return in exactly one split",
+       id_counts.where("count <> 1").count() == 0 and id_counts.count() == saved_features.count(),
+       f"{id_counts.count()} ids in splits, {saved_features.count()} in return_features")
+missing_or_extra = (union_splits.drop("split_table").exceptAll(saved_features).count()
+                    + saved_features.exceptAll(union_splits.drop("split_table")).count())
+scheck("splits == return_features (ids and values)", missing_or_extra == 0, f"{missing_or_extra} differing rows")
+
+split_checks_df = spark.createDataFrame(split_checks)
+display(split_checks_df)
+assert all(c["result"] == "PASS" for c in split_checks), "Split verification failed"
+display(union_splits.groupBy("split_table", "tax_year").count().orderBy("tax_year"))
+
+# ---------- Exports and run snapshot (actual IDs and values) ----------
+for year, table in SPLITS.items():
+    spark.table(table).orderBy("return_id").toPandas().to_csv(
+        repo_root / f"outputs/{table.split('.')[-1]}.csv", index=False)
+split_checks_df.toPandas().to_csv(repo_root / "outputs/split_checks.csv", index=False)
+
+snapshot = (saved_features.withColumn("table", F.lit(FEATURES_TABLE))
+            .unionByName(union_splits.withColumnRenamed("split_table", "table"))
+            .select("table", "return_id", "tax_year", "deduction_to_income")
+            .orderBy("table", "return_id").toPandas())
+snap_dir = repo_root / "outputs/run_snapshots"
+snap_dir.mkdir(parents=True, exist_ok=True)
+snap_name = f"run_{RUN_STARTED_AT.replace(':', '').replace('-', '')}"
+snapshot.to_csv(snap_dir / f"{snap_name}.csv", index=False, float_format="%.17g")
+(snap_dir / f"{snap_name}.json").write_text(json.dumps({
+    "run_started_at_utc": RUN_STARTED_AT,
+    "run_completed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "notebook_url": NOTEBOOK_URL, "input": ACCEPTED_TABLE,
+    "tables": {t: int((snapshot["table"] == t).sum()) for t in snapshot["table"].unique()},
+}, indent=2) + "\n", encoding="utf-8")
+print("Snapshot written:", snap_name, "rows:", len(snapshot))
+
+# COMMAND ----------
+
+# DBTITLE 1,Compare the two latest complete runs
+import pandas as pd
+
+# Snapshots are only written at the end of a COMPLETE run (after every assert passed).
+snaps = sorted(snap_dir.glob("run_*.csv"))
+print("Complete-run snapshots:", [p.stem for p in snaps])
+if len(snaps) < 2:
+    print("Only one complete run so far: run the whole notebook again to produce the comparison.")
+else:
+    prev_path, curr_path = snaps[-2], snaps[-1]
+    prev = pd.read_csv(prev_path, dtype=str, keep_default_na=False)
+    curr = pd.read_csv(curr_path, dtype=str, keep_default_na=False)
+    key = ["table", "return_id"]
+    merged = prev.merge(curr, on=key, how="outer", suffixes=("_run1", "_run2"), indicator=True)
+    diffs = merged[(merged["_merge"] != "both")
+                   | (merged["tax_year_run1"] != merged["tax_year_run2"])
+                   | (merged["deduction_to_income_run1"] != merged["deduction_to_income_run2"])]
+    per_table = curr.groupby("table").agg(rows=("return_id", "size"), distinct_ids=("return_id", "nunique"))
+    comparison = {
+        "run1": json.loads(prev_path.with_suffix(".json").read_text()),
+        "run2": json.loads(curr_path.with_suffix(".json").read_text()),
+        "run1_snapshot": f"outputs/run_snapshots/{prev_path.name}",
+        "run2_snapshot": f"outputs/run_snapshots/{curr_path.name}",
+        "rows_compared": int(len(merged)),
+        "differing_rows": int(len(diffs)),
+        "identical_ids_and_values": bool(len(diffs) == 0 and len(prev) == len(curr)),
+        "run2_rows_per_table": {t: {"rows": int(r.rows), "distinct_ids": int(r.distinct_ids)}
+                                for t, r in per_table.iterrows()},
+        "no_appended_copies": bool((per_table["rows"] == per_table["distinct_ids"]).all()),
+    }
+    (repo_root / "outputs/run_comparison.json").write_text(json.dumps(comparison, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(comparison, indent=2))
+    assert comparison["identical_ids_and_values"], diffs
+    assert comparison["no_appended_copies"]
+
+# COMMAND ----------
+
+# DBTITLE 1,Handoff
+# MAGIC %md
+# MAGIC ### Handoff
+# MAGIC
+# MAGIC * **Inputs:**
+# MAGIC   * `training.to6_challenge3_inputs.returns_corrected`: accepted.
+# MAGIC   * `training.to6_challenge3_inputs.returns_initial`: rejected on completeness (`R02` has NULL income) and uniqueness (`R01` appears 2 times).
+# MAGIC   * Both come from `training.to6_challenge3_inputs.parsed_source`, according to `source_lineage`.
+# MAGIC * **Outputs (`training.to6_c3_c399a52409d8`):**
+# MAGIC   * `return_features`: 12 rows.
+# MAGIC   * `features_train`: 2022, 4 rows.
+# MAGIC   * `features_validation`: 2023, 4 rows.
+# MAGIC   * `features_test`: 2024, 4 rows.
+# MAGIC   * `initial_rejected_records`: 3 rows.
+# MAGIC * **Ratio:** `deduction_to_income = deduction / income`, NULL when `income = 0` (`R03`, `R09`). Only `return_id`, `tax_year` and the ratio are saved.
+# MAGIC * **Checks performed:**
+# MAGIC   * The quality gate runs on both batches.
+# MAGIC   * 10 read-back checks pass on `return_features`, including `R04` = 59 / 400 = 0.1475 and a NULL ratio for zero income.
+# MAGIC   * 8 split checks pass: each split holds only its year, and each accepted return appears in exactly one split.
+# MAGIC   * Runs 1 (2026-11-20T16:50:29Z) and 2 (16:51:59Z) are identical across 24 rows, with no appended copies (`outputs/run_comparison.json`).
+# MAGIC * **Not verified:**
+# MAGIC   * Catalog UI lineage.
+# MAGIC   * The `parsed_source` contents.
+# MAGIC   * The GitHub commit and push.
+# MAGIC   * Model leakage, which is out of scope here.
+# MAGIC
+# MAGIC The full details are in `SUBMISSION.md`.

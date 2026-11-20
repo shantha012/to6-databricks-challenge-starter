@@ -1,0 +1,12 @@
+{
+  "run_started_at_utc": "2026-11-20T16:50:29Z",
+  "run_completed_at_utc": "2026-11-20T16:51:28Z",
+  "notebook_url": "https://dbc-48a16403-f66f.cloud.databricks.com/editor/notebooks/127024866559576",
+  "input": "training.to6_challenge3_inputs.returns_corrected",
+  "tables": {
+    "training.to6_c3_c399a52409d8.features_test": 4,
+    "training.to6_c3_c399a52409d8.features_train": 4,
+    "training.to6_c3_c399a52409d8.features_validation": 4,
+    "training.to6_c3_c399a52409d8.return_features": 12
+  }
+}

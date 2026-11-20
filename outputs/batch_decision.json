@@ -1,5 +1,5 @@
 {
-  "checked_at_utc": "2026-11-20T16:46:09+00:00",
+  "checked_at_utc": "2026-11-20T16:52:18+00:00",
   "rules": {
     "completeness": "Required fields return_id, tax_year, income and deduction must be non-null",
     "uniqueness": "Each return_id must occur exactly once in the batch",
